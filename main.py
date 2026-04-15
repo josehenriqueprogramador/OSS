@@ -1,5 +1,5 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 import json
 import random
 
@@ -7,13 +7,13 @@ app = FastAPI()
 
 class ArenaManager:
     def __init__(self):
-        self.rooms: dict = {} # {room_id: {"connections": [], "queue": [], "state": {}}}
+        self.rooms: dict = {}
 
     def get_initial_state(self):
         return {
-            "p1": {"nome": None, "pts": 0, "st": 100, "pos": "Em pé", "sid": None},
-            "p2": {"nome": None, "pts": 0, "st": 100, "pos": "Em pé", "sid": None},
-            "logs": ["Tatame pronto. Entrem na arena!"],
+            "p1": {"nome": None, "pts": 0, "pos": "Em pé", "sid": None},
+            "p2": {"nome": None, "pts": 0, "pos": "Em pé", "sid": None},
+            "logs": ["Tatame pronto. Oss!"],
             "turno_de": 0,
             "vitoria": False,
             "vencedor": None
@@ -25,10 +25,15 @@ class ArenaManager:
             self.rooms[room_id] = {"connections": [], "queue": [], "state": self.get_initial_state()}
         
         sid = str(id(websocket))
+        state = self.rooms[room_id]["state"]
+
+        # Se o mesmo nome entrar, removemos o registro anterior dele para evitar bugs
+        if state["p1"]["nome"] == name: state["p1"] = {"nome": None, "pts": 0, "pos": "Em pé", "sid": None}
+        if state["p2"]["nome"] == name: state["p2"] = {"nome": None, "pts": 0, "pos": "Em pé", "sid": None}
+
         conn_data = {"ws": websocket, "name": name, "sid": sid}
         self.rooms[room_id]["connections"].append(conn_data)
         
-        state = self.rooms[room_id]["state"]
         if not state["p1"]["sid"]:
             state["p1"].update({"nome": name, "sid": sid})
         elif not state["p2"]["sid"]:
@@ -39,17 +44,18 @@ class ArenaManager:
         return sid
 
     async def broadcast(self, room_id: str):
+        if room_id not in self.rooms: return
         room = self.rooms[room_id]
-        # Enviamos o estado e a lista de SIDs para o cliente saber quem ele é
         data = {
             "state": room["state"],
             "queue": [p["name"] for p in room["queue"]],
             "spectators": len(room["connections"]) - (2 if room["state"]["p2"]["sid"] else 1 if room["state"]["p1"]["sid"] else 0)
         }
         for conn in room["connections"]:
-            # Adicionamos o SID específico de cada um na mensagem individual
             data["your_sid"] = conn["sid"]
-            await conn["ws"].send_text(json.dumps(data))
+            try:
+                await conn["ws"].send_text(json.dumps(data))
+            except: pass
 
 manager = ArenaManager()
 
@@ -83,8 +89,8 @@ async def arena_page(room_id: str, nome: str):
             body {{ background: #111; color: #eee; font-family: monospace; text-align: center; padding: 10px; }}
             .scoreboard {{ display: flex; justify-content: space-around; background: #000; padding: 10px; border: 2px solid #0f0; margin-bottom: 10px; }}
             .btn {{ background: #222; color: #0f0; border: 1px solid #0f0; padding: 15px; width: 100%; display: none; margin: 5px 0; font-weight: bold; border-radius: 5px; }}
+            .btn-exit {{ background: transparent; color: #f44; border: 1px solid #f44; padding: 5px 10px; font-size: 0.7em; margin-top: 20px; text-decoration: none; display: inline-block; }}
             .log-box {{ background: #000; height: 100px; font-size: 0.7em; text-align: left; padding: 10px; margin: 10px 0; border-left: 2px solid #0f0; overflow: hidden; }}
-            .queue {{ background: #1a1a1a; padding: 10px; font-size: 0.8em; color: #888; text-align: left; border: 1px dashed #444; }}
         </style></head>
         <body>
             <div style="font-size: 0.7em; color: #555;">SALA: {room_id} | <span id="specs">0</span> ASSISTINDO</div>
@@ -104,7 +110,7 @@ async def arena_page(room_id: str, nome: str):
                 <button id="btn-finalizar" onclick="enviar('finalizar')" class="btn" style="color:#f0f; border-color:#f0f;">FINALIZAR</button>
             </div>
 
-            <div class="queue"><b>FILA:</b> <span id="queue-list">-</span></div>
+            <a href="/" class="btn-exit">ABANDONAR ARENA</a>
 
             <script>
                 let mySid = null;
@@ -120,7 +126,6 @@ async def arena_page(room_id: str, nome: str):
                     document.getElementById('p1').innerText = state.p1.pts;
                     document.getElementById('p2').innerText = state.p2.pts;
                     document.getElementById('specs').innerText = data.spectators;
-                    document.getElementById('queue-list').innerText = data.queue.join(", ") || "Vazia";
                     document.getElementById('logs').innerHTML = state.logs.slice(-4).reverse().map(l=>"<p>• "+l+"</p>").join("");
 
                     const isP1 = state.p1.sid === mySid;
@@ -132,7 +137,7 @@ async def arena_page(room_id: str, nome: str):
                     if (state.vitoria) {{
                         document.getElementById('status').innerText = "FIM DE LUTA: " + state.vencedor;
                     }} else if (isP1 || isP2) {{
-                        document.getElementById('status').innerText = meuTurno ? "Sua vez de atacar!" : "Defendendo...";
+                        document.getElementById('status').innerText = meuTurno ? "SUA VEZ!" : "AGUARDE...";
                         if(meuTurno) {{
                             document.getElementById('btn-finalizar').style.display = 'block';
                             if(isP1 ? state.p1.pos === "Em pé" : state.p2.pos === "Em pé") {{
@@ -143,10 +148,9 @@ async def arena_page(room_id: str, nome: str):
                             }}
                         }}
                     }} else {{
-                        document.getElementById('status').innerText = "Você está na arquibancada";
+                        document.getElementById('status').innerText = "VOCÊ ESTÁ NA ARQUIBANCADA";
                     }}
                 }};
-
                 function enviar(a) {{ socket.send(a); }}
             </script>
         </body>
@@ -163,49 +167,35 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, player_name: st
             data = await websocket.receive_text()
             room = manager.rooms[room_id]
             state = room["state"]
-            
-            # Valida se quem enviou o comando é o lutador do turno
             p_idx = state["turno_de"]
-            current_lutador_sid = state["p1"]["sid"] if p_idx == 0 else state["p2"]["sid"]
+            current_sid = state["p1"]["sid"] if p_idx == 0 else state["p2"]["sid"]
             
-            if sid == current_lutador_sid and not state["vitoria"]:
+            if sid == current_sid and not state["vitoria"]:
                 p_atk = state["p1"] if p_idx == 0 else state["p2"]
                 p_def = state["p2"] if p_idx == 0 else state["p1"]
                 dado = random.randint(1, 6)
+                msg = ""
                 
                 if data == "queda":
-                    if dado >= 3:
-                        p_atk["pts"] += 2
-                        p_atk["pos"], p_def["pos"] = "Por cima", "Por baixo"
-                        msg = f"{p_atk['nome']} aplicou uma queda!"
+                    if dado >= 3: 
+                        p_atk["pts"] += 2; p_atk["pos"], p_def["pos"] = "Chão", "Chão"; msg = f"{p_atk['nome']} derrubou!"
                     else: msg = f"{p_def['nome']} defendeu a queda."
-                
-                elif data == "passar":
-                    if dado >= 4:
-                        p_atk["pts"] += 3
-                        msg = f"{p_atk['nome']} passou a guarda!"
-                    else: msg = f"{p_def['nome']} repôs a guarda."
-
-                elif data == "raspar":
-                    if dado >= 4:
-                        p_atk["pts"] += 2
-                        p_atk["pos"], p_def["pos"] = "Por cima", "Por baixo"
-                        msg = f"{p_atk['nome']} raspou!"
-                    else: msg = f"A raspagem de {p_atk['nome']} falhou."
-
+                elif data == "passar" or data == "raspar":
+                    if dado >= 4: p_atk["pts"] += 2; msg = f"{p_atk['nome']} progrediu!"
+                    else: msg = f"{p_def['nome']} travou a luta."
                 elif data == "finalizar":
-                    if dado >= 5:
-                        state["vitoria"] = True
-                        state["vencedor"] = p_atk["nome"]
-                        msg = f"🔥 {p_atk['nome']} FINALIZOU A LUTA!"
-                    else:
-                        p_atk["pos"], p_def["pos"] = "Em pé", "Em pé"
-                        msg = f"{p_atk['nome']} perdeu o ajuste e a luta voltou em pé."
+                    if dado >= 5: state["vitoria"] = True; state["vencedor"] = p_atk["nome"]; msg = f"🔥 {p_atk['nome']} FINALIZOU!"
+                    else: p_atk["pos"] = p_def["pos"] = "Em pé"; msg = f"Finalização falhou! Luta volta em pé."
 
                 state["logs"].append(msg)
-                state["turno_de"] = 1 - p_idx # Troca turno
+                state["turno_de"] = 1 - p_idx
                 await manager.broadcast(room_id)
 
     except WebSocketDisconnect:
-        manager.rooms[room_id]["connections"] = [c for c in manager.rooms[room_id]["connections"] if c["sid"] != sid]
+        room = manager.rooms[room_id]
+        room["connections"] = [c for c in room["connections"] if c["sid"] != sid]
+        state = room["state"]
+        # Se o lutador desconectar, liberamos o slot dele
+        if state["p1"]["sid"] == sid: state["p1"] = {"nome": None, "pts": 0, "pos": "Em pé", "sid": None}
+        if state["p2"]["sid"] == sid: state["p2"] = {"nome": None, "pts": 0, "pos": "Em pé", "sid": None}
         await manager.broadcast(room_id)
