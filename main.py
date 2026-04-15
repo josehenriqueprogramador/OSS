@@ -5,39 +5,76 @@ import random
 
 app = FastAPI()
 
-class ConnectionManager:
+class RoomManager:
     def __init__(self):
-        self.active_connections: dict = {} 
-        self.game_states: dict = {} 
+        self.rooms: dict = {} # {room_id: {"connections": [], "queue": [], "state": {}}}
 
-    async def connect(self, websocket: WebSocket, room_id: str):
+    def get_initial_state(self):
+        return {
+            "p1": {"nome": None, "pts": 0, "st": 100, "pos": "Em pé", "sid": None},
+            "p2": {"nome": None, "pts": 0, "st": 100, "pos": "Em pé", "sid": None},
+            "logs": ["Tatame pronto. Entrem na fila!"],
+            "turno_de": 0,
+            "vitoria": False
+        }
+
+    async def connect(self, websocket: WebSocket, room_id: str, name: str):
         await websocket.accept()
-        if room_id not in self.active_connections:
-            self.active_connections[room_id] = []
-            self.game_states[room_id] = {
-                "p1": {"nome": "Aguardando...", "pontos": 0, "stamina": 100, "pos": "Em pé"},
-                "p2": {"nome": "Aguardando...", "pontos": 0, "stamina": 100, "pos": "Em pé"},
-                "logs": ["Tatame liberado. Oss!"],
-                "turno_de": 0,
-                "vitoria": False
-            }
+        if room_id not in self.rooms:
+            self.rooms[room_id] = {"connections": [], "queue": [], "state": self.get_initial_state()}
         
-        if len(self.active_connections[room_id]) < 2:
-            self.active_connections[room_id].append(websocket)
-            return True
-        return False
-
-    def disconnect(self, websocket: WebSocket, room_id: str):
-        if room_id in self.active_connections:
-            self.active_connections[room_id].remove(websocket)
+        sid = str(id(websocket))
+        conn_data = {"ws": websocket, "name": name, "sid": sid}
+        self.rooms[room_id]["connections"].append(conn_data)
+        
+        # Se não houver lutadores, ocupa o posto. Se não, vai para a fila.
+        state = self.rooms[room_id]["state"]
+        if not state["p1"]["sid"]:
+            state["p1"].update({"nome": name, "sid": sid})
+        elif not state["p2"]["sid"]:
+            state["p2"].update({"nome": name, "sid": sid})
+        else:
+            self.rooms[room_id]["queue"].append(conn_data)
+        
+        return sid
 
     async def broadcast(self, room_id: str):
-        if room_id in self.active_connections:
-            state = json.dumps(self.game_states[room_id])
-            for connection in self.active_connections[room_id]:
-                await connection.send_text(state)
+        room = self.rooms[room_id]
+        data = {
+            "state": room["state"],
+            "queue": [p["name"] for p in room["queue"]],
+            "spectators": len(room["connections"]) - (2 if room["state"]["p2"]["sid"] else 1)
+        }
+        for conn in room["connections"]:
+            await conn["ws"].send_text(json.dumps(data))
 
-manager = ConnectionManager()
+    async def next_match(self, room_id: str, loser_sid: str):
+        room = self.rooms[room_id]
+        state = room["state"]
+        
+        # Reset de pontos e stamina para a nova luta
+        state["p1"]["pts"] = state["p2"]["pts"] = 0
+        state["p1"]["st"] = state["p2"]["st"] = 100
+        state["p1"]["pos"] = state["p2"]["pos"] = "Em pé"
+        state["vitoria"] = False
+        
+        # Se o perdedor for P1, ele vai para o fim da fila e o P2 espera o próximo
+        # Se houver gente na fila, o próximo entra no lugar do perdedor
+        if room["queue"]:
+            next_p = room["queue"].pop(0)
+            if state["p1"]["sid"] == loser_sid:
+                # Adiciona quem perdeu ao fim da fila
+                old_p = next(c for c in room["connections"] if c["sid"] == loser_sid)
+                room["queue"].append(old_p)
+                state["p1"].update({"nome": next_p["name"], "sid": next_p["sid"]})
+            else:
+                old_p = next(c for c in room["connections"] if c["sid"] == loser_sid)
+                room["queue"].append(old_p)
+                state["p2"].update({"nome": next_p["name"], "sid": next_p["sid"]})
+            
+            state["logs"] = [f"NOVA LUTA: {state['p1']['nome']} vs {state['p2']['nome']}"]
+
+manager = RoomManager()
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
@@ -48,108 +85,94 @@ async def index():
             <style>
                 body { background: #000; color: #0f0; font-family: monospace; text-align: center; padding: 50px 20px; }
                 input { background: #111; border: 1px solid #0f0; color: #0f0; padding: 12px; width: 80%; margin: 10px; font-family: monospace; }
-                button { background: #0f0; border: none; padding: 15px; font-weight: bold; width: 85%; border-radius: 5px; cursor: pointer; }
+                button { background: #0f0; border: none; padding: 15px; font-weight: bold; width: 85%; cursor: pointer; }
             </style>
         </head>
         <body>
-            <h1>OSS ONLINE 🥋</h1>
-            <p>SISTEMA DE CAMPEONATO</p>
+            <h1>OSS ARENA 🥋</h1>
             <form onsubmit="event.preventDefault(); window.location.href='/luta/'+document.getElementById('sala').value+'?nome='+document.getElementById('nome').value;">
-                <input type="text" id="nome" placeholder="NOME DO LUTADOR" required><br>
-                <input type="text" id="sala" placeholder="ID DA SALA (EX: 10)" required><br>
-                <button type="submit">ENTRAR NO TATAME</button>
+                <input type="text" id="nome" placeholder="SEU NOME" required><br>
+                <input type="text" id="sala" placeholder="CÓDIGO DA ARENA" required><br>
+                <button type="submit">ENTRAR NA ARENA</button>
             </form>
         </body>
     </html>
     """
 
 @app.get("/luta/{room_id}", response_class=HTMLResponse)
-async def game_page(room_id: str, nome: str):
+async def arena(room_id: str, nome: str):
     return f"""
     <html>
         <head>
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <style>
-                body {{ background: #111; color: #eee; font-family: monospace; text-align: center; margin: 0; padding: 10px; }}
-                .scoreboard {{ display: flex; justify-content: space-around; background: #222; padding: 10px; border: 2px solid #0f0; border-radius: 8px; }}
-                .log-box {{ background: #000; height: 120px; font-size: 0.75em; text-align: left; padding: 10px; margin: 10px 0; border-left: 3px solid #0f0; overflow-y: hidden; }}
-                .btn {{ background: #222; color: #0f0; border: 1px solid #0f0; padding: 14px; width: 100%; display: none; margin: 5px 0; font-weight: bold; border-radius: 5px; }}
-                .st-bar {{ background: #333; height: 8px; width: 100%; border-radius: 4px; margin-top: 5px; }}
-                .st-fill {{ background: #0f0; height: 100%; transition: 0.5s; }}
-                #status-luta {{ font-size: 1.2em; margin: 10px 0; text-transform: uppercase; }}
+                body {{ background: #111; color: #eee; font-family: monospace; text-align: center; padding: 10px; }}
+                .arena-info {{ background: #222; padding: 5px; font-size: 0.8em; margin-bottom: 5px; color: #888; }}
+                .scoreboard {{ display: flex; justify-content: space-around; background: #000; padding: 10px; border: 2px solid #0f0; }}
+                .btn {{ background: #222; color: #0f0; border: 1px solid #0f0; padding: 12px; width: 100%; display: none; margin: 5px 0; font-weight: bold; }}
+                .queue-box {{ background: #1a1a1a; padding: 10px; margin-top: 10px; border: 1px dashed #444; font-size: 0.8em; text-align: left; }}
+                .log-box {{ background: #000; height: 100px; font-size: 0.7em; text-align: left; padding: 10px; margin: 10px 0; overflow: hidden; }}
             </style>
         </head>
         <body>
-            <div id="game-ui">
-                <h2 id="status-luta">CONECTANDO...</h2>
-                <div class="scoreboard">
-                    <div id="p1-ui"><b>-</b><br><span style="font-size:1.5em" id="p1-pts">0</span><div class="st-bar"><div id="p1-st" class="st-fill"></div></div></div>
-                    <div style="align-self: center; color: #555;">VS</div>
-                    <div id="p2-ui"><b>-</b><br><span style="font-size:1.5em" id="p2-pts">0</span><div class="st-bar"><div id="p2-st" class="st-fill"></div></div></div>
-                </div>
-                <div class="log-box" id="logs"></div>
-                <p id="pos-info" style="color:#0f0">📍 POSIÇÃO: -</p>
-                
-                <div id="controles">
-                    <button onclick="enviar('queda')" class="btn" id="btn-queda">QUEDA (+2)</button>
-                    <button onclick="enviar('passar')" class="btn" id="btn-passar">PASSAR GUARDA (+3)</button>
-                    <button onclick="enviar('raspar')" class="btn" id="btn-raspar">RASPAGEM (+2)</button>
-                    <button onclick="enviar('costas')" class="btn" id="btn-costas">PEGAR COSTAS (+4)</button>
-                    <button onclick="enviar('montar')" class="btn" id="btn-montar">MONTAR (+4)</button>
-                    <button onclick="enviar('finalizar')" class="btn" id="btn-finalizar" style="color:#f0f; border-color:#f0f;">FINALIZAR</button>
-                </div>
+            <div class="arena-info">ARENA: {room_id} | ESPECTADORES: <span id="spec-count">0</span></div>
+            <div class="scoreboard">
+                <div id="p1-ui"><b id="p1-name">-</b><br><span id="p1-pts">0</span></div>
+                <div style="color:#555">X</div>
+                <div id="p2-ui"><b id="p2-name">-</b><br><span id="p2-pts">0</span></div>
+            </div>
+            
+            <div id="status" style="margin: 10px; font-weight: bold;">CONECTANDO...</div>
+            <div class="log-box" id="logs"></div>
+
+            <div id="controles">
+                <button onclick="enviar('queda')" class="btn" id="btn-queda">QUEDA (+2)</button>
+                <button onclick="enviar('passar')" class="btn" id="btn-passar">PASSAR (+3)</button>
+                <button onclick="enviar('finalizar')" class="btn" id="btn-finalizar" style="color:#f0f;">FINALIZAR</button>
+                <button onclick="enviar('proxima')" class="btn" id="btn-proxima" style="background:#0f0; color:#000; display:none;">PRÓXIMA LUTA</button>
             </div>
 
+            <div class="queue-box"><b>FILA DE DESAFIANTES:</b><br><span id="queue-list">Vazia</span></div>
+
             <script>
-                const roomId = "{room_id}";
-                const meuNome = "{nome}";
-                let protocol = window.location.protocol === "https:" ? "wss://" : "ws://";
-                let socket = new WebSocket(protocol + window.location.host + "/ws/" + roomId + "/" + meuNome);
-                let meuIndex = -1;
+                const nome = "{nome}";
+                let mySid = "";
+                let socket = new WebSocket((location.protocol==="https:"?"wss://":"ws://")+location.host+"/ws/{room_id}/"+nome);
 
-                socket.onmessage = function(event) {{
-                    const data = JSON.parse(event.data);
-                    if (meuIndex === -1) meuIndex = (data.p1.nome === meuNome) ? 0 : 1;
-                    atualizarUI(data);
-                }};
+                socket.onmessage = function(e) {{
+                    const data = JSON.parse(e.data);
+                    const state = data.state;
+                    if(!mySid) mySid = data.state.current_sid_check; // Ajustado no server
 
-                function atualizarUI(data) {{
-                    document.getElementById('p1-ui').querySelector('b').innerText = data.p1.nome;
-                    document.getElementById('p2-ui').querySelector('b').innerText = data.p2.nome;
-                    document.getElementById('p1-pts').innerText = data.p1.pontos;
-                    document.getElementById('p2-pts').innerText = data.p2.pontos;
-                    document.getElementById('p1-st').style.width = data.p1.stamina + "%";
-                    document.getElementById('p2-st').style.width = data.p2.stamina + "%";
+                    document.getElementById('p1-name').innerText = state.p1.nome || "---";
+                    document.getElementById('p2-name').innerText = state.p2.nome || "---";
+                    document.getElementById('p1-pts').innerText = state.p1.pts;
+                    document.getElementById('p2-pts').innerText = state.p2.pts;
+                    document.getElementById('spec-count').innerText = data.spectators;
+                    document.getElementById('queue-list').innerText = data.queue.join(", ") || "Vazia";
+                    document.getElementById('logs').innerHTML = state.logs.slice(-4).reverse().map(l=>"<p>• "+l+"</p>").join("");
+
+                    const isP1 = (state.p1.sid === mySid);
+                    const isP2 = (state.p2.sid === mySid);
+                    const meuTurno = (state.turno_de === 0 && isP1) || (state.turno_de === 1 && isP2);
+
+                    document.querySelectorAll('.btn').forEach(b=>b.style.display='none');
                     
-                    const meuTurno = (data.turno_de === meuIndex);
-                    const minhaPos = meuIndex === 0 ? data.p1.pos : data.p2.pos;
-                    
-                    document.getElementById('status-luta').innerText = data.vitoria ? "FIM DE LUTA" : (meuTurno ? "SEU ATAQUE" : "DEFENDENDO...");
-                    document.getElementById('status-luta').style.color = meuTurno ? "#0f0" : "#f66";
-                    document.getElementById('pos-info').innerText = "📍 ESTADO: " + minhaPos;
-                    document.getElementById('logs').innerHTML = data.logs.slice(-4).reverse().map(l => "<p style='margin:5px 0; border-bottom:1px solid #222;'>• "+l+"</p>").join("");
-
-                    // LÓGICA DE BOTÕES DINÂMICOS
-                    document.querySelectorAll('.btn').forEach(b => b.style.display = 'none');
-                    if (meuTurno && !data.vitoria) {{
-                        if (minhaPos === "Em pé") {{
-                            document.getElementById('btn-queda').style.display = 'block';
-                            document.getElementById('btn-finalizar').style.display = 'block';
-                        }} else if (minhaPos === "Por baixo") {{
-                            document.getElementById('btn-raspar').style.display = 'block';
-                            document.getElementById('btn-finalizar').style.display = 'block';
-                        }} else if (minhaPos === "Por cima") {{
-                            document.getElementById('btn-passar').style.display = 'block';
-                            document.getElementById('btn-costas').style.display = 'block';
-                            document.getElementById('btn-finalizar').style.display = 'block';
-                        }} else if (minhaPos === "Dominando") {{
-                            document.getElementById('btn-montar').style.display = 'block';
-                            document.getElementById('btn-finalizar').style.display = 'block';
+                    if(state.vitoria) {{
+                        document.getElementById('status').innerText = "FIM DE LUTA";
+                        if(isP1 || isP2) document.getElementById('btn-proxima').style.display='block';
+                    }} else if(isP1 || isP2) {{
+                        document.getElementById('status').innerText = meuTurno ? "SEU ATAQUE!" : "AGUARDE...";
+                        if(meuTurno) {{
+                            document.getElementById('btn-queda').style.display='block';
+                            document.getElementById('btn-passar').style.display='block';
+                            document.getElementById('btn-finalizar').style.display='block';
                         }}
+                    }} else {{
+                        document.getElementById('status').innerText = "ASSISTINDO ARQUIBANCADA";
                     }}
-                }}
-
-                function enviar(acao) {{ socket.send(acao); }}
+                }};
+                function enviar(a){{ socket.send(a); }}
             </script>
         </body>
     </html>
@@ -157,66 +180,46 @@ async def game_page(room_id: str, nome: str):
 
 @app.websocket("/ws/{room_id}/{player_name}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str, player_name: str):
-    success = await manager.connect(websocket, room_id)
-    if not success:
-        await websocket.close()
-        return
-
-    state = manager.game_states[room_id]
-    if state["p1"]["nome"] == "Aguardando...": state["p1"]["nome"] = player_name
-    elif state["p2"]["nome"] == "Aguardando..." and state["p1"]["nome"] != player_name: state["p2"]["nome"] = player_name
-    
+    sid = await manager.connect(websocket, room_id, player_name)
     await manager.broadcast(room_id)
+    
+    room = manager.rooms[room_id]
+    state = room["state"]
 
     try:
         while True:
             data = await websocket.receive_text()
+            
+            # Ação de Próxima Luta (chama a fila)
+            if data == "proxima" and state["vitoria"]:
+                # Descobre quem perdeu
+                loser_sid = state["p2"]["sid"] if state["vencedor"] == state["p1"]["nome"] else state["p1"]["sid"]
+                await manager.next_match(room_id, loser_sid)
+                await manager.broadcast(room_id)
+                continue
+
+            # Lógica de combate (apenas se for o turno do lutador)
             p_idx = state["turno_de"]
-            p_atk = state["p1"] if p_idx == 0 else state["p2"]
-            p_def = state["p2"] if p_idx == 0 else state["p1"]
-            dado = random.randint(1, 6)
-            msg = ""
-
-            if data == "queda":
-                if dado >= 3:
-                    p_atk["pontos"] += 2
-                    p_atk["pos"], p_def["pos"] = "Por cima", "Por baixo"
-                    msg = f"{p_atk['nome']} derrubou com estilo!"
-                else: msg = f"{p_def['nome']} defendeu a queda."
-
-            elif data == "raspar":
-                if dado >= 4:
-                    p_atk["pontos"] += 2
-                    p_atk["pos"], p_def["pos"] = "Por cima", "Por baixo"
-                    msg = f"{p_atk['nome']} raspou e inverteu!"
-                else: msg = f"{p_def['nome']} pesou o quadril e evitou a raspagem."
-
-            elif data == "passar":
-                if dado >= 4:
-                    p_atk["pontos"] += 3
-                    p_atk["pos"] = "Dominando"
-                    msg = f"{p_atk['nome']} passou a guarda!"
-                else: msg = f"{p_def['nome']} repôs a guarda."
-
-            elif data == "costas" or data == "montar":
-                if dado >= 5:
-                    p_atk["pontos"] += 4
-                    msg = f"{p_atk['nome']} conquistou os 4 pontos!"
-                else: msg = f"{p_def['nome']} escapou do domínio."
-
-            elif data == "finalizar":
-                chance = 6 if p_atk["pos"] == "Em pé" else 5
-                if dado >= chance:
-                    state["vitoria"] = True
-                    msg = f"🔥 OSS! {p_atk['nome']} FINALIZOU A LUTA!"
-                else:
-                    p_atk["pos"], p_def["pos"] = "Em pé", "Em pé"
-                    msg = f"{p_atk['nome']} perdeu o ajuste e a luta voltou em pé."
-
-            p_atk["stamina"] = max(0, p_atk["stamina"] - 12)
-            state["logs"].append(msg)
-            state["turno_de"] = 1 - p_idx
-            await manager.broadcast(room_id)
-
+            current_p_sid = state["p1"]["sid"] if p_idx == 0 else state["p2"]["sid"]
+            
+            if sid == current_p_sid and not state["vitoria"]:
+                p_atk = state["p1"] if p_idx == 0 else state["p2"]
+                p_def = state["p2"] if p_idx == 0 else state["p1"]
+                dado = random.randint(1, 6)
+                
+                if data == "queda":
+                    if dado >= 3: p_atk["pts"] += 2; msg = f"{p_atk['nome']} pontuou!"
+                    else: msg = f"{p_def['nome']} defendeu!"
+                elif data == "finalizar":
+                    if dado == 6: 
+                        state["vitoria"] = True; state["vencedor"] = p_atk["nome"]
+                        msg = f"🔥 {p_atk['nome']} FINALIZOU!"
+                    else: msg = f"Tentativa falha de {p_atk['nome']}"
+                
+                state["logs"].append(msg)
+                state["turno_de"] = 1 - p_idx
+                await manager.broadcast(room_id)
+                
     except WebSocketDisconnect:
-        manager.disconnect(websocket, room_id)
+        manager.rooms[room_id]["connections"] = [c for c in room["connections"] if c["sid"] != sid]
+        await manager.broadcast(room_id)
